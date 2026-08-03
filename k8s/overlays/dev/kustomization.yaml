@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: python-api-dev
+resources:
+  - namespace.yaml
+  - ../../base
+images:
+  - name: APP_IMAGE
+    newName: ghcr.io/example/python-api
+    newTag: latest
+replicas:
+  - name: python-api
+    count: 1
