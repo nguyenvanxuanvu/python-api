@@ -6,6 +6,14 @@ on:
       - main
   workflow_dispatch:
     inputs:
+      action:
+        description: "Action to run"
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - deploy
+          - rollback
       environment:
         description: "Target environment"
         required: true
@@ -14,6 +22,10 @@ on:
         options:
           - dev
           - prod
+      rollback_revision:
+        description: "Rollback revision number (optional, empty means previous revision)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -29,6 +41,7 @@ env:
 
 jobs:
   build-test-push:
+    if: ${{ github.event_name == 'push' || github.event.inputs.action == 'deploy' }}
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.meta.outputs.image }}
@@ -82,11 +95,13 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ steps.meta.outputs.image }}
 
   deploy:
-    runs-on: [self-hosted, local-k8s]
+    if: ${{ github.event_name == 'push' || github.event.inputs.action == 'deploy' }}
+    runs-on: ubuntu-latest
     needs: build-test-push
     environment: ${{ needs.build-test-push.outputs.target_env }}
     timeout-minutes: 20
@@ -94,47 +109,169 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Set up kustomize
-        uses: imranismail/setup-kustomize@v2
-
-      - name: Write kubeconfig
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
         run: |
-          if [ -n "${{ secrets.KUBE_CONFIG }}" ]; then
-            mkdir -p "$HOME/.kube"
-            printf "%s" "${{ secrets.KUBE_CONFIG }}" > "$HOME/.kube/config"
-            chmod 600 "$HOME/.kube/config"
-            echo "Using kubeconfig from repository secret"
-          else
-            echo "KUBE_CONFIG secret not set; using runner local kubeconfig"
-          fi
+          set -euo pipefail
+          trap 'echo "[ERROR] Prepare SSH failed at line $LINENO"' ERR
 
-      - name: Validate cluster access
-        run: |
-          kubectl version --client
-          kubectl get nodes
+          echo "[INFO] Validating required SSH secrets"
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
 
-      - name: Set image and deploy
+          echo "[INFO] Creating ~/.ssh files"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf "%s\n" "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf "%s\n" "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+          echo "[INFO] SSH key fingerprint"
+          ssh-keygen -lf "$HOME/.ssh/id_ed25519"
+          echo "[INFO] known_hosts entries"
+          wc -l "$HOME/.ssh/known_hosts"
+
+      - name: Deploy to EC2 via SSH
         env:
           IMAGE: ${{ needs.build-test-push.outputs.image }}
           TARGET_ENV: ${{ needs.build-test-push.outputs.target_env }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_PORT: ${{ secrets.EC2_SSH_PORT }}
         run: |
-          rm -rf /tmp/k8s
-          cp -R k8s /tmp/k8s
-          cd "/tmp/k8s/overlays/$TARGET_ENV"
-          kustomize edit set image APP_IMAGE="$IMAGE"
-          kubectl apply -k "/tmp/k8s/overlays/$TARGET_ENV"
+          set -euo pipefail
+          trap 'echo "[ERROR] Deploy failed at line $LINENO"' ERR
 
-      - name: Wait for rollout
-        env:
-          TARGET_ENV: ${{ needs.build-test-push.outputs.target_env }}
-        run: |
+          echo "[INFO] Input validation"
+          test -n "$EC2_HOST"
+          test -n "$EC2_USER"
+          SSH_PORT="${EC2_SSH_PORT:-22}"
+          TMP_DIR="/tmp/python-api-${{ github.run_id }}-${TARGET_ENV}"
+
+          SSH_OPTS="-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes"
+
+          echo "[INFO] Runner network debug"
+          echo "Target: $EC2_USER@$EC2_HOST:$SSH_PORT"
+          getent hosts "$EC2_HOST" || true
+
+          echo "[INFO] SSH preflight"
+          ssh $SSH_OPTS -v -p "$SSH_PORT" "$EC2_USER@$EC2_HOST" "echo '[REMOTE] ssh-ok'"
+
+          echo "[INFO] Create remote temp dir: $TMP_DIR"
+          ssh $SSH_OPTS -p "$SSH_PORT" "$EC2_USER@$EC2_HOST" "mkdir -p '$TMP_DIR'"
+
+          echo "[INFO] Copy k8s manifests"
+          scp -v -P "$SSH_PORT" -r k8s "$EC2_USER@$EC2_HOST:$TMP_DIR/"
+
+          echo "[INFO] Run remote deploy script"
+          ssh $SSH_OPTS -p "$SSH_PORT" "$EC2_USER@$EC2_HOST" \
+            "IMAGE='$IMAGE' TARGET_ENV='$TARGET_ENV' TMP_DIR='$TMP_DIR' bash -s" <<'REMOTE'
+          set -euxo pipefail
+          trap 'echo "[REMOTE-ERROR] Failed at line $LINENO"' ERR
+
+          echo "[REMOTE] Host and user"
+          hostname
+          whoami
+
+          command -v kubectl >/dev/null 2>&1 || { echo "kubectl is required on EC2"; exit 1; }
+          command -v kustomize >/dev/null 2>&1 || { echo "kustomize is required on EC2"; exit 1; }
+
+          echo "[REMOTE] Tool versions"
+          kubectl version --client
+          kustomize version
+
+          echo "[REMOTE] Cluster access check"
+          kubectl get nodes >/dev/null
+          kubectl get nodes -o wide
+
+          echo "[REMOTE] Apply manifests"
+          cd "$TMP_DIR/k8s/overlays/$TARGET_ENV"
+          kustomize edit set image APP_IMAGE="$IMAGE"
+          kubectl apply -k .
+
+          echo "[REMOTE] Rollout status"
           kubectl rollout status deployment/python-api -n "python-api-$TARGET_ENV" --timeout=120s
 
-      - name: Smoke check
+          echo "[REMOTE] Workload summary"
+          kubectl -n "python-api-$TARGET_ENV" get pods,svc
+
+          echo "[REMOTE] Cleanup temp dir"
+          rm -rf "$TMP_DIR"
+          REMOTE
+
+  rollback:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'rollback' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    timeout-minutes: 20
+    steps:
+      - name: Prepare SSH
         env:
-          TARGET_ENV: ${{ needs.build-test-push.outputs.target_env }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
         run: |
-          kubectl -n "python-api-$TARGET_ENV" get svc python-api
+          set -euo pipefail
+          trap 'echo "[ERROR] Prepare SSH failed at line $LINENO"' ERR
+
+          echo "[INFO] Validating required SSH secrets"
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+
+          echo "[INFO] Creating ~/.ssh files"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf "%s\n" "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf "%s\n" "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Rollback on EC2 via SSH
+        env:
+          TARGET_ENV: ${{ github.event.inputs.environment }}
+          ROLLBACK_REVISION: ${{ github.event.inputs.rollback_revision }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_PORT: ${{ secrets.EC2_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          trap 'echo "[ERROR] Rollback failed at line $LINENO"' ERR
+
+          test -n "$EC2_HOST"
+          test -n "$EC2_USER"
+          test -n "$TARGET_ENV"
+          SSH_PORT="${EC2_SSH_PORT:-22}"
+          SSH_OPTS="-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes"
+
+          echo "[INFO] Starting rollback on python-api-$TARGET_ENV"
+          ssh $SSH_OPTS -p "$SSH_PORT" "$EC2_USER@$EC2_HOST" \
+            "TARGET_ENV='$TARGET_ENV' ROLLBACK_REVISION='$ROLLBACK_REVISION' bash -s" <<'REMOTE'
+          set -euxo pipefail
+          trap 'echo "[REMOTE-ERROR] Rollback failed at line $LINENO"' ERR
+
+          NAMESPACE="python-api-$TARGET_ENV"
+
+          command -v kubectl >/dev/null 2>&1 || { echo "kubectl is required on EC2"; exit 1; }
+
+          echo "[REMOTE] Rollout history before rollback"
+          kubectl -n "$NAMESPACE" rollout history deployment/python-api
+
+          if [ -n "${ROLLBACK_REVISION:-}" ]; then
+            echo "[REMOTE] Rolling back to revision: $ROLLBACK_REVISION"
+            kubectl -n "$NAMESPACE" rollout undo deployment/python-api --to-revision="$ROLLBACK_REVISION"
+          else
+            echo "[REMOTE] Rolling back to previous revision"
+            kubectl -n "$NAMESPACE" rollout undo deployment/python-api
+          fi
+
+          echo "[REMOTE] Waiting for rollout"
+          kubectl -n "$NAMESPACE" rollout status deployment/python-api --timeout=120s
+
+          echo "[REMOTE] Rollout history after rollback"
+          kubectl -n "$NAMESPACE" rollout history deployment/python-api
+
+          echo "[REMOTE] Pod and service summary"
+          kubectl -n "$NAMESPACE" get pods,svc
+          REMOTE
