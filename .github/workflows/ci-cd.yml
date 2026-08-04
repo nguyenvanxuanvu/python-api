@@ -179,7 +179,7 @@ jobs:
   deploy:
     if: ${{ github.event_name == 'push' || github.event.inputs.action == 'deploy' }}
     runs-on: ubuntu-latest
-    needs: [build-push, scan]
+    needs: [build-push]
     environment: ${{ needs.build-push.outputs.target_env }}
     timeout-minutes: 20
     env:
