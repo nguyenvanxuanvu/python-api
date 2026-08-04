@@ -214,7 +214,7 @@ jobs:
 
       - name: Wait for rollout
         run: |
-          NAMESPACE="python-api-$TARGET_ENV"
+          NAMESPACE="backend-api-$TARGET_ENV"
           kubectl rollout status deployment/python-api -n "$NAMESPACE" --timeout=120s
           kubectl -n "$NAMESPACE" get pods,svc
 
@@ -249,7 +249,7 @@ jobs:
       - name: Execute rollback
         run: |
           set -euxo pipefail
-          NAMESPACE="python-api-$TARGET_ENV"
+          NAMESPACE="backend-api-$TARGET_ENV"
 
           if [ -n "${ROLLBACK_REVISION:-}" ]; then
             echo "Rolling back to revision $ROLLBACK_REVISION"
